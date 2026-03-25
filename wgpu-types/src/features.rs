@@ -1255,6 +1255,17 @@ bitflags_array! {
         /// Supported platforms:
         /// - Vulkan (except VK_KHR_portability_subset if multisampleArrayImage is not available)
         const MULTISAMPLE_ARRAY = 1 << 56;
+
+        /// Allows importing DMA-BUF file descriptors as textures via the Vulkan HAL.
+        ///
+        /// Supported platforms:
+        /// - Vulkan on Linux (with [VK_KHR_external_memory_fd] and [VK_EXT_external_memory_dma_buf])
+        ///
+        /// This is a native only feature.
+        ///
+        /// [VK_KHR_external_memory_fd]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_external_memory_fd.html
+        /// [VK_EXT_external_memory_dma_buf]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_external_memory_dma_buf.html
+        const VULKAN_EXTERNAL_MEMORY_DMA_BUF = 1 << 57;
     }
 
     /// Features that are not guaranteed to be supported.

@@ -602,6 +602,83 @@ impl super::Device {
         })
     }
 
+    /// Create a texture by importing a DMA-BUF file descriptor.
+    ///
+    /// This enables zero-copy texture sharing on Linux between components that
+    /// produce DMA-BUF handles and the Vulkan renderer.
+    ///
+    /// # Requirements
+    ///
+    /// - Vulkan with `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf`
+    /// - The [`VULKAN_EXTERNAL_MEMORY_DMA_BUF`](wgt::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) feature must be enabled
+    ///
+    /// # Safety
+    ///
+    /// - `dmabuf_fd` must be a valid DMA-BUF file descriptor compatible with `desc`
+    /// - The caller must ensure the DMA-BUF remains valid for the lifetime of the texture
+    /// - Vulkan takes ownership of the file descriptor; the caller must NOT close it
+    #[cfg(unix)]
+    pub unsafe fn texture_from_dmabuf_fd(
+        &self,
+        dmabuf_fd: std::os::unix::io::RawFd,
+        desc: &crate::TextureDescriptor,
+    ) -> Result<super::Texture, crate::DeviceError> {
+        if !self
+            .shared
+            .features
+            .contains(wgt::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            log::error!(
+                "Vulkan driver does not support VK_KHR_external_memory_fd \
+                 and VK_EXT_external_memory_dma_buf"
+            );
+            return Err(crate::DeviceError::Unexpected);
+        }
+
+        let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        let image =
+            self.create_image_without_memory(desc, Some(&mut external_memory_image_info))?;
+
+        // DMA-BUF imports require dedicated allocation.
+        // https://docs.vulkan.org/guide/latest/extensions/external.html#_importing_memory
+        let mut dedicated_allocate_info =
+            vk::MemoryDedicatedAllocateInfo::default().image(image.raw);
+
+        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dmabuf_fd);
+
+        let mem_type_index = self
+            .find_memory_type_index(
+                image.requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or(crate::DeviceError::Unexpected)?;
+
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(image.requirements.size)
+            .memory_type_index(mem_type_index as _)
+            .push_next(&mut import_memory_info)
+            .push_next(&mut dedicated_allocate_info);
+
+        let memory = unsafe { self.shared.raw.allocate_memory(&memory_allocate_info, None) }
+            .map_err(super::map_host_device_oom_err)?;
+
+        unsafe { self.shared.raw.bind_image_memory(image.raw, memory, 0) }
+            .map_err(super::map_host_device_oom_err)?;
+
+        Ok(unsafe {
+            self.texture_from_raw(
+                image.raw,
+                desc,
+                None,
+                super::TextureMemory::Dedicated(memory),
+            )
+        })
+    }
+
     fn create_shader_module_impl(
         &self,
         spv: &[u32],
