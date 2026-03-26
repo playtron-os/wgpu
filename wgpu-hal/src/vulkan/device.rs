@@ -407,6 +407,20 @@ pub struct DmaBufPlaneInfo {
     pub total_size: u64,
 }
 
+/// Information returned when exporting a texture's backing memory as a file
+/// descriptor via [`Device::export_texture_memory_fd`].
+#[cfg(unix)]
+pub struct ExportedTextureMemory {
+    /// POSIX file descriptor for the exported memory.
+    /// The caller takes ownership and must close it when done.
+    pub fd: std::os::unix::io::RawFd,
+    /// Total allocation size in bytes.
+    pub size: u64,
+    /// Row pitch (stride) in bytes as reported by `vkGetImageSubresourceLayout`.
+    /// Only meaningful for `VK_IMAGE_TILING_LINEAR` images.
+    pub row_pitch: u64,
+}
+
 impl super::Device {
     /// # Safety
     ///
@@ -756,6 +770,184 @@ impl super::Device {
                 None,
                 super::TextureMemory::Dedicated(memory),
             )
+        })
+    }
+
+    /// Create a texture whose backing memory can be exported as a POSIX file
+    /// descriptor (DMA-BUF or opaque FD).
+    ///
+    /// The image is created with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`
+    /// so the exported FD can be imported by other APIs (CUDA, VA-API, etc.).
+    /// Memory is allocated with `VkExportMemoryAllocateInfo` and dedicated
+    /// allocation.
+    ///
+    /// Use [`export_texture_memory_fd`] to retrieve the file descriptor after
+    /// creation.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure the device supports
+    ///   `VULKAN_EXTERNAL_MEMORY_DMA_BUF`.
+    /// - The returned texture must not outlive the device.
+    #[cfg(unix)]
+    pub unsafe fn create_exportable_texture(
+        &self,
+        desc: &crate::TextureDescriptor,
+    ) -> Result<super::Texture, crate::DeviceError> {
+        if !self
+            .shared
+            .features
+            .contains(wgt::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            log::error!(
+                "Vulkan driver does not support VK_KHR_external_memory_fd \
+                 and VK_EXT_external_memory_dma_buf (required for exportable textures)"
+            );
+            return Err(crate::DeviceError::Unexpected);
+        }
+
+        let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+        // Build image with LINEAR tiling so CUDA can map the memory as
+        // a linear buffer via cuExternalMemoryGetMappedBuffer.
+        let copy_size = desc.copy_extent();
+        let original_format = self.shared.private_caps.map_texture_format(desc.format);
+
+        let vk_info = vk::ImageCreateInfo::default()
+            .image_type(conv::map_texture_dimension(desc.dimension))
+            .format(original_format)
+            .extent(conv::map_copy_extent(&copy_size))
+            .mip_levels(desc.mip_level_count)
+            .array_layers(desc.array_layer_count())
+            .samples(vk::SampleCountFlags::from_raw(desc.sample_count))
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(conv::map_texture_usage(desc.usage))
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_image_info);
+
+        let raw_image = unsafe { self.shared.raw.create_image(&vk_info, None) }.map_err(|err| {
+            log::error!("vkCreateImage for exportable texture failed: {err:?}");
+            super::map_host_device_oom_and_ioca_err(err)
+        })?;
+
+        let req = unsafe { self.shared.raw.get_image_memory_requirements(raw_image) };
+
+        let mut export_memory_info = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+        let mut dedicated_allocate_info =
+            vk::MemoryDedicatedAllocateInfo::default().image(raw_image);
+
+        let mem_type_index = self
+            .find_memory_type_index(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| {
+                log::error!("No suitable memory type for exportable texture");
+                unsafe { self.shared.raw.destroy_image(raw_image, None) };
+                crate::DeviceError::Unexpected
+            })?;
+
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type_index as _)
+            .push_next(&mut export_memory_info)
+            .push_next(&mut dedicated_allocate_info);
+
+        let memory = unsafe { self.shared.raw.allocate_memory(&memory_allocate_info, None) }
+            .map_err(|err| {
+                log::error!("vkAllocateMemory for exportable texture failed: {err:?}");
+                unsafe { self.shared.raw.destroy_image(raw_image, None) };
+                super::map_host_device_oom_err(err)
+            })?;
+
+        unsafe { self.shared.raw.bind_image_memory(raw_image, memory, 0) }.map_err(|err| {
+            log::error!("vkBindImageMemory for exportable texture failed: {err:?}");
+            unsafe {
+                self.shared.raw.free_memory(memory, None);
+                self.shared.raw.destroy_image(raw_image, None);
+            }
+            super::map_host_device_oom_err(err)
+        })?;
+
+        Ok(unsafe {
+            self.texture_from_raw(
+                raw_image,
+                desc,
+                None,
+                super::TextureMemory::Dedicated(memory),
+            )
+        })
+    }
+
+    /// Export the backing memory of a texture as a POSIX file descriptor.
+    ///
+    /// The texture **must** have been created with [`create_exportable_texture`].
+    /// The returned [`ExportedTextureMemory`] contains an opaque FD (for CUDA
+    /// import), the allocation size, and the row pitch from
+    /// `vkGetImageSubresourceLayout`.
+    ///
+    /// # Safety
+    ///
+    /// - The texture must have been created via `create_exportable_texture`.
+    /// - The caller takes ownership of the returned file descriptor and is
+    ///   responsible for closing it (or passing it to another API that assumes
+    ///   ownership).
+    /// - The texture must remain alive for as long as the FD is in use by
+    ///   an external consumer.
+    #[cfg(unix)]
+    pub unsafe fn export_texture_memory_fd(
+        &self,
+        texture: &super::Texture,
+    ) -> Result<ExportedTextureMemory, crate::DeviceError> {
+        let memory = match &texture.memory {
+            super::TextureMemory::Dedicated(mem) => *mem,
+            _ => {
+                log::error!("export_texture_memory_fd: texture was not created with dedicated exportable memory");
+                return Err(crate::DeviceError::Unexpected);
+            }
+        };
+
+        let ext_mem_fd = self
+            .shared
+            .extension_fns
+            .external_memory_fd
+            .as_ref()
+            .ok_or_else(|| {
+                log::error!("VK_KHR_external_memory_fd not loaded");
+                crate::DeviceError::Unexpected
+            })?;
+
+        let fd_info = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+
+        let fd = unsafe { ext_mem_fd.get_memory_fd(&fd_info) }.map_err(|err| {
+            log::error!("vkGetMemoryFdKHR failed: {err:?}");
+            super::map_host_device_oom_err(err)
+        })?;
+
+        let req = unsafe { self.shared.raw.get_image_memory_requirements(texture.raw) };
+
+        // Query the row pitch from the linear image layout.
+        let subresource = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            array_layer: 0,
+        };
+        let layout = unsafe {
+            self.shared
+                .raw
+                .get_image_subresource_layout(texture.raw, subresource)
+        };
+
+        Ok(ExportedTextureMemory {
+            fd,
+            size: req.size,
+            row_pitch: layout.row_pitch,
         })
     }
 

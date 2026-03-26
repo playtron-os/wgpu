@@ -37,6 +37,8 @@ mod swapchain;
 pub use adapter::PhysicalDeviceFeatures;
 #[cfg(unix)]
 pub use device::DmaBufPlaneInfo;
+#[cfg(unix)]
+pub use device::ExportedTextureMemory;
 
 use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
 use core::{
@@ -301,6 +303,8 @@ struct DeviceExtensionFunctions {
     timeline_semaphore: Option<ExtensionFn<khr::timeline_semaphore::Device>>,
     ray_tracing: Option<RayTracingDeviceExtensionFunctions>,
     mesh_shading: Option<ext::mesh_shader::Device>,
+    #[cfg(unix)]
+    external_memory_fd: Option<khr::external_memory_fd::Device>,
 }
 
 struct RayTracingDeviceExtensionFunctions {

@@ -2196,6 +2196,17 @@ impl super::Adapter {
             None
         };
 
+        #[cfg(unix)]
+        let external_memory_fd_fn =
+            if enabled_extensions.contains(&khr::external_memory_fd::NAME) {
+                Some(khr::external_memory_fd::Device::new(
+                    &self.instance.raw,
+                    &raw_device,
+                ))
+            } else {
+                None
+            };
+
         let naga_options = {
             use naga::back::spv;
 
@@ -2415,6 +2426,8 @@ impl super::Adapter {
                 timeline_semaphore: timeline_semaphore_fn,
                 ray_tracing: ray_tracing_fns,
                 mesh_shading: mesh_shading_fns,
+                #[cfg(unix)]
+                external_memory_fd: external_memory_fd_fn,
             },
             pipeline_cache_validation_key,
             vendor_id: self.phd_capabilities.properties.vendor_id,

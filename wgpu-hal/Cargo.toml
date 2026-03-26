@@ -193,6 +193,10 @@ name = "halmark"
 name = "raw-gles"
 required-features = ["gles"]
 
+[[example]]
+name = "export-texture"
+required-features = ["vulkan"]
+
 #####################
 ### Platform: All ###
 #####################
