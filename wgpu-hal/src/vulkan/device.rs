@@ -393,6 +393,20 @@ struct CompiledStage {
     temp_raw_module: Option<vk::ShaderModule>,
 }
 
+/// Parameters for importing a single DMA-BUF plane via Vulkan.
+#[cfg(unix)]
+pub struct DmaBufPlaneInfo {
+    /// DRM format modifier (0 = linear).
+    pub drm_modifier: u64,
+    /// Row pitch (stride) of this plane in bytes.
+    pub stride: u32,
+    /// Byte offset of this plane within the DMA-BUF.
+    pub offset: u32,
+    /// Total size of the DMA-BUF in bytes (needed for sub-buffer import).
+    /// When 0, the image memory requirements determine the allocation size.
+    pub total_size: u64,
+}
+
 impl super::Device {
     /// # Safety
     ///
@@ -602,26 +616,25 @@ impl super::Device {
         })
     }
 
-    /// Create a texture by importing a DMA-BUF file descriptor.
+    /// Import a Linux DMA-BUF file descriptor as a Vulkan texture.
     ///
-    /// This enables zero-copy texture sharing on Linux between components that
-    /// produce DMA-BUF handles and the Vulkan renderer.
-    ///
-    /// # Requirements
-    ///
-    /// - Vulkan with `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf`
-    /// - The [`VULKAN_EXTERNAL_MEMORY_DMA_BUF`](wgt::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) feature must be enabled
+    /// The `plane` parameter provides the DRM format modifier, stride, and
+    /// offset used when creating the `VkImage`. Linear buffers (modifier == 0)
+    /// use `VK_IMAGE_TILING_LINEAR`; tiled buffers use
+    /// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`.
     ///
     /// # Safety
     ///
-    /// - `dmabuf_fd` must be a valid DMA-BUF file descriptor compatible with `desc`
-    /// - The caller must ensure the DMA-BUF remains valid for the lifetime of the texture
-    /// - Vulkan takes ownership of the file descriptor; the caller must NOT close it
+    /// - `dmabuf_fd` must be a valid DMA-BUF file descriptor. Vulkan takes
+    ///   ownership; the caller must **not** close it afterwards.
+    /// - The buffer dimensions and format described by `desc` must match the
+    ///   actual DMA-BUF allocation.
     #[cfg(unix)]
     pub unsafe fn texture_from_dmabuf_fd(
         &self,
         dmabuf_fd: std::os::unix::io::RawFd,
         desc: &crate::TextureDescriptor,
+        plane: &DmaBufPlaneInfo,
     ) -> Result<super::Texture, crate::DeviceError> {
         if !self
             .shared
@@ -635,16 +648,58 @@ impl super::Device {
             return Err(crate::DeviceError::Unexpected);
         }
 
+        let copy_size = desc.copy_extent();
+        let original_format = self.shared.private_caps.map_texture_format(desc.format);
+
         let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
-        let image =
-            self.create_image_without_memory(desc, Some(&mut external_memory_image_info))?;
+        // Use DRM_FORMAT_MODIFIER_EXT tiling for ALL DMA-BUF imports (including
+        // linear / modifier==0). This lets us specify the exact stride via
+        // ImageDrmFormatModifierExplicitCreateInfoEXT, avoiding Vulkan choosing
+        // a different row pitch that would cause striped/corrupted output.
+        let plane_layout = vk::SubresourceLayout {
+            offset: 0,                         // plane offset handled at bind time
+            size: 0,                           // Vulkan ignores for explicit modifier
+            row_pitch: plane.stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let plane_layouts = [plane_layout];
 
-        // DMA-BUF imports require dedicated allocation.
-        // https://docs.vulkan.org/guide/latest/extensions/external.html#_importing_memory
+        let mut drm_modifier_info =
+            vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(plane.drm_modifier)
+                .plane_layouts(&plane_layouts);
+
+        let vk_info = vk::ImageCreateInfo::default()
+            .image_type(conv::map_texture_dimension(desc.dimension))
+            .format(original_format)
+            .extent(conv::map_copy_extent(&copy_size))
+            .mip_levels(desc.mip_level_count)
+            .array_layers(desc.array_layer_count())
+            .samples(vk::SampleCountFlags::from_raw(desc.sample_count))
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(conv::map_texture_usage(desc.usage))
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_image_info)
+            .push_next(&mut drm_modifier_info);
+
+        let raw_image =
+            unsafe { self.shared.raw.create_image(&vk_info, None) }.map_err(|err| {
+                log::error!("vkCreateImage for DMA-BUF import failed: {err:?}");
+                super::map_host_device_oom_and_ioca_err(err)
+            })?;
+
+        let req = unsafe { self.shared.raw.get_image_memory_requirements(raw_image) };
+
+        let bind_offset = plane.offset as u64;
+
+        // DMA-BUF imports: use dedicated allocation when binding at offset 0,
+        // otherwise allocate the full buffer and bind at the plane offset.
         let mut dedicated_allocate_info =
-            vk::MemoryDedicatedAllocateInfo::default().image(image.raw);
+            vk::MemoryDedicatedAllocateInfo::default().image(raw_image);
 
         let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -652,26 +707,51 @@ impl super::Device {
 
         let mem_type_index = self
             .find_memory_type_index(
-                image.requirements.memory_type_bits,
+                req.memory_type_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
-            .ok_or(crate::DeviceError::Unexpected)?;
+            .ok_or_else(|| {
+                log::error!("No suitable memory type for DMA-BUF import");
+                crate::DeviceError::Unexpected
+            })?;
 
-        let memory_allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(image.requirements.size)
+        let alloc_size = if plane.total_size > 0 {
+            plane.total_size
+        } else {
+            req.size
+        };
+
+        let mut memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(alloc_size)
             .memory_type_index(mem_type_index as _)
-            .push_next(&mut import_memory_info)
-            .push_next(&mut dedicated_allocate_info);
+            .push_next(&mut import_memory_info);
+
+        // Only use dedicated allocation when binding at offset 0.
+        if bind_offset == 0 {
+            memory_allocate_info = memory_allocate_info.push_next(&mut dedicated_allocate_info);
+        }
 
         let memory = unsafe { self.shared.raw.allocate_memory(&memory_allocate_info, None) }
-            .map_err(super::map_host_device_oom_err)?;
+            .map_err(|err| {
+                log::error!("vkAllocateMemory for DMA-BUF import failed: {err:?}");
+                unsafe { self.shared.raw.destroy_image(raw_image, None) };
+                super::map_host_device_oom_err(err)
+            })?;
 
-        unsafe { self.shared.raw.bind_image_memory(image.raw, memory, 0) }
-            .map_err(super::map_host_device_oom_err)?;
+        unsafe { self.shared.raw.bind_image_memory(raw_image, memory, bind_offset) }.map_err(
+            |err| {
+                log::error!("vkBindImageMemory for DMA-BUF import failed: {err:?}");
+                unsafe {
+                    self.shared.raw.free_memory(memory, None);
+                    self.shared.raw.destroy_image(raw_image, None);
+                }
+                super::map_host_device_oom_err(err)
+            },
+        )?;
 
         Ok(unsafe {
             self.texture_from_raw(
-                image.raw,
+                raw_image,
                 desc,
                 None,
                 super::TextureMemory::Dedicated(memory),

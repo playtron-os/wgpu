@@ -35,6 +35,8 @@ mod semaphore_list;
 mod swapchain;
 
 pub use adapter::PhysicalDeviceFeatures;
+#[cfg(unix)]
+pub use device::DmaBufPlaneInfo;
 
 use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
 use core::{
