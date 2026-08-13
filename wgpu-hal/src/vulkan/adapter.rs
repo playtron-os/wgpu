@@ -940,7 +940,13 @@ impl PhysicalDeviceFeatures {
         features.set(
             F::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
             caps.supports_extension(khr::external_memory_fd::NAME)
-                && caps.supports_extension(ext::external_memory_dma_buf::NAME),
+                && caps.supports_extension(ext::external_memory_dma_buf::NAME)
+                // `texture_from_dmabuf_fd` always imports through
+                // DRM_FORMAT_MODIFIER_EXT tiling, so the modifier extension is a
+                // hard requirement, not an optional extra. Without it here the
+                // feature reads as supported on drivers that lack it and the
+                // import builds an image Vulkan considers invalid.
+                && caps.supports_extension(ext::image_drm_format_modifier::NAME),
         );
         features.set(
             F::EXPERIMENTAL_MESH_SHADER,
